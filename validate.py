@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from datasets import get_normal_image_paths
 from models.modules import get_position_encoding
 from models.utils import get_logp
 from utils import get_residual_features, get_matched_ref_features
@@ -19,6 +20,9 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
     constraintor.eval()
     for estimator in estimators:  
         estimator.eval()
+
+    # normal_image_paths = get_normal_image_paths('/path/to/your/dataset', class_name, dataset='btad')  # normal train images
+    # matched_indices = np.load(f'./aligned/indices/{dataset_name}/{class_name}_knn_indices.npy')
     
     label_list, gt_mask_list = [], []
     logps1_list = [list() for _ in range(args.feature_levels)]
@@ -31,6 +35,16 @@ def validate(args, encoder, vq_ops, constraintor, estimators, test_loader, ref_f
         image, label, mask, _ = batch    
         gt_mask_list.append(mask.squeeze(1).cpu().numpy().astype(bool))
         label_list.append(label.cpu().numpy().astype(bool).ravel())
+
+        # get ref_features from aligned ref images
+        # indices = matched_indices[idx]
+        # rimage_paths = [normal_image_paths[ind] for ind in indices]
+        # rimages = load_and_transform_vision_data(rimage_paths, device)
+        # with torch.no_grad():
+        #     ref_features = encoder.encode_image_from_tensors(rimages.to(device))
+        #     for l in range(len(ref_features)):
+        #         _, _, c = ref_features[l].shape
+        #         ref_features[l] = ref_features[l].reshape(-1, c)
         
         image = image.to(device)
         size = image.shape[-1]
