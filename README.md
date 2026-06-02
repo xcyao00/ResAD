@@ -108,6 +108,6 @@ If you find this repository useful, please consider citing our work:
 }
 ```
 
-If you are interested in our work, you can also follow our previous works: [BGAD (CVPR2023)](https://github.com/xcyao00/BGAD), [PMAD (AAAI2023)](https://github.com/xcyao00/PMAD), [FOD (ICCV2023)](https://github.com/xcyao00/FOD), [HGAD (ECCV2024)](https://github.com/xcyao00/HGAD). Or, you can follow our github page [xcyao00](https://github.com/xcyao00).
+If you are interested in our work, you can also see our other works: [BGAD (CVPR2023)](https://github.com/xcyao00/BGAD), [PMAD (AAAI2023)](https://github.com/xcyao00/PMAD), [FOD (ICCV2023)](https://github.com/xcyao00/FOD), [HGAD (ECCV2024)](https://github.com/xcyao00/HGAD), [ADPretrain (NeurIPS2025)](https://github.com/xcyao00/ADPretrain), [MMR-AD (CVPR2026)](https://xcyao00.github.io/MMR-AD). Or, you can follow our github page [xcyao00](https://github.com/xcyao00).
 
 
