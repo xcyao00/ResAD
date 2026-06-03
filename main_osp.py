@@ -8,8 +8,7 @@ import timm
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from train import train
-from validate import validate
+from validate_osp import validate # validate_osp をインポート
 from datasets.mvtec import MVTEC, MVTECANO
 from datasets.visa import VISA, VISAANO
 from datasets.btad import BTAD
@@ -21,8 +20,6 @@ from datasets.capsules import CAPSULES, CAPSULESANO
 
 from models.fc_flow import load_flow_model
 from models.modules import MultiScaleConv
-from models.vq import MultiScaleVQ
-from models.clip_feature_extractor import CLIPRawFeatureExtractor
 from utils import init_seeds, get_residual_features, get_mc_matched_ref_features, get_mc_reference_features
 from utils import BoundaryAverager
 from losses.loss import calculate_log_barrier_bi_occ_loss
@@ -33,49 +30,48 @@ from classes import CAPSULES_TO_CAPSULES
 
 warnings.filterwarnings('ignore')
 
-TOTAL_SHOT = 4  # total few-shot reference samples
+TOTAL_SHOT = 4  
 FIRST_STAGE_EPOCH = 10
 SETTINGS = {'visa_to_mvtec': VISA_TO_MVTEC, 'mvtec_to_visa': MVTEC_TO_VISA,
             'mvtec_to_btad': MVTEC_TO_BTAD, 'mvtec_to_mvtec3d': MVTEC_TO_MVTEC3D,
             'mvtec_to_mpdd': MVTEC_TO_MPDD, 'mvtec_to_mvtecloco': MVTEC_TO_MVTECLOCO,
             'mvtec_to_brats': MVTEC_TO_BRATS,'mvtec_to_mvtec':MVTEC_TO_MVTEC, 'visa_to_visa':VISA_TO_VISA, 'capsules_to_capsules': CAPSULES_TO_CAPSULES}
 
+# ==========================================
+# OSP (Orthogonal Subspace Projection) 用関数
+# ==========================================
+def compute_osp_matrices(ref_features_tuple, keep_variance=0.95):
+    proj_matrices, means = [], []
+    for ref_feat in ref_features_tuple:
+        if ref_feat.dim() == 4:
+            B, C, H, W = ref_feat.shape
+            flat_ref = ref_feat.permute(0, 2, 3, 1).reshape(-1, C)
+        else:
+            flat_ref = ref_feat
+            C = flat_ref.shape[-1]
+        mean = flat_ref.mean(dim=0, keepdim=True)
+        centered = flat_ref - mean
+        U, S, V = torch.linalg.svd(centered.cpu(), full_matrices=False)
+        var = (S ** 2) / (centered.size(0) - 1)
+        cum_var = torch.cumsum(var, dim=0) / var.sum()
+        k = torch.searchsorted(cum_var, keep_variance).item() + 1
+        basis = V[:k, :].T.to(ref_feat.device)
+        proj_matrix = torch.mm(basis, basis.T)
+        proj_matrices.append(proj_matrix)
+        means.append(mean.to(ref_feat.device))
+    return proj_matrices, means
 
-def get_feature_image_size(args):
-    if args.feature_backbone == "clip_raw":
-        return args.clip_image_size
-    return 224
-
-
-def build_feature_encoder(args):
-    if args.feature_backbone == "clip_raw":
-        if len(args.clip_layers) != 3:
-            raise ValueError("clip_raw currently expects exactly 3 clip_layers for ResAD multi-level features.")
-        encoder = CLIPRawFeatureExtractor(
-            model_name=args.clip_model,
-            pretrained=args.clip_pretrained,
-            layers=args.clip_layers,
-            image_size=args.clip_image_size,
-            freeze=True,
-            weight_source=args.clip_weight_source,
-            checkpoint=args.clip_checkpoint,
-        ).to(args.device)
-        encoder.eval()
-        return encoder, encoder.feature_info.channels()
-
-    if args.feature_backbone != "original":
-        raise ValueError(f"Unsupported feature_backbone: {args.feature_backbone}")
-    if args.backbone == 'wide_resnet50_2':
-        encoder = timm.create_model('wide_resnet50_2', features_only=True,
-                out_indices=(1, 2, 3), pretrained=True).eval()
-        encoder = encoder.to(args.device)
-        return encoder, encoder.feature_info.channels()
-    if args.backbone == 'tf_efficientnet_b6':
-        encoder = timm.create_model('tf_efficientnet_b6', features_only=True,
-                out_indices=(1, 2, 3), pretrained=True).eval()
-        encoder = encoder.to(args.device)
-        return encoder, encoder.feature_info.channels()
-    raise ValueError(f"Unsupported backbone: {args.backbone}")
+def apply_osp(residuals_list, proj_matrices, means):
+    osp_results = []
+    for i, res in enumerate(residuals_list):
+        B, C, H, W = res.shape
+        res_flat = res.permute(0, 2, 3, 1).reshape(-1, C)
+        res_centered = res_flat - means[i]
+        res_parallel = torch.mm(res_centered, proj_matrices[i])
+        res_ortho = res_centered - res_parallel
+        osp_results.append(res_ortho.reshape(B, H, W, C).permute(0, 3, 1, 2))
+    return osp_results
+# ==========================================
 
 
 def main(args):
@@ -83,67 +79,43 @@ def main(args):
         CLASSES = SETTINGS[args.setting]
     else:
         raise ValueError(f"Dataset setting must be in {SETTINGS.keys()}, but got {args.setting}.")
-    image_size = get_feature_image_size(args)
-
-    if args.classes == 'capsules':  # from mvtec to other datasets  # from mvtec to other datasets
+                
+    if args.classes == 'capsules':  
         train_dataset1 = CAPSULES(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
-                               normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader1 = DataLoader(
-            train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )
+                               normalize="w50", img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader1 = DataLoader(train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)
         train_dataset2 = CAPSULESANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
-                                  normalize='w50',
-                                  img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader2 = DataLoader(
-            train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )    
+                                  normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader2 = DataLoader(train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)    
     
-    elif CLASSES['seen'][0] in MVTEC.CLASS_NAMES:  # from mvtec to other datasets
+    elif CLASSES['seen'][0] in MVTEC.CLASS_NAMES:  
         train_dataset1 = MVTEC(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
-                               normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader1 = DataLoader(
-            train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )
+                               normalize="w50", img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader1 = DataLoader(train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)
         train_dataset2 = MVTECANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
-                                  normalize='w50',
-                                  img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader2 = DataLoader(
-            train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )
-    else:  # from visa to mvtec
+                                  normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader2 = DataLoader(train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)
+    else:  
         train_dataset1 = VISA(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
-                               normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader1 = DataLoader(
-            train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )
+                               normalize="w50", img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader1 = DataLoader(train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)
         train_dataset2 = VISAANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
-                                 normalize="w50",
-                                 img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
-        train_loader2 = DataLoader(
-            train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )
-    encoder, feat_dims = build_feature_encoder(args)
-    if len(feat_dims) != args.feature_levels:
-        raise ValueError(
-            f"feature_levels={args.feature_levels} does not match encoder outputs {len(feat_dims)}. "
-            "For clip_raw, keep --feature_levels 3 with the default three --clip_layers."
-        )
+                                 normalize="w50", img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
+        train_loader2 = DataLoader(train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True)
+        
+    if args.backbone == 'wide_resnet50_2':
+        encoder = timm.create_model('wide_resnet50_2', features_only=True, out_indices=(1, 2, 3), pretrained=True).eval()  
+        encoder = encoder.to(args.device)
+        feat_dims = encoder.feature_info.channels()
+    elif args.backbone == 'tf_efficientnet_b6':
+        encoder = timm.create_model('tf_efficientnet_b6', features_only=True, out_indices=(1, 2, 3), pretrained=True).eval()  
+        encoder = encoder.to(args.device)
+        feat_dims = encoder.feature_info.channels()
+        
     boundary_ops = BoundaryAverager(num_levels=args.feature_levels)
-    use_vqops = not args.disable_vqops
-    print("[VQOps] use_vqops:", use_vqops)
-    vq_ops = None
-    optimizer_vq = None
-    scheduler_vq = None
-    if use_vqops:
-        vq_ops = MultiScaleVQ(num_embeddings=args.num_embeddings, channels=feat_dims).to(args.device)
-        optimizer_vq = torch.optim.Adam(vq_ops.parameters(), lr=args.lr, weight_decay=0.0005)
-        scheduler_vq = torch.optim.lr_scheduler.MultiStepLR(optimizer_vq, milestones=[70, 90], gamma=0.1)
     
+    # constraintor のみ保持 (vq_ops は削除)
     constraintor = MultiScaleConv(feat_dims).to(args.device)
-    # weight_decay is the l2 weight penalty lambda, weight_decay = lambda / 2
     optimizer0 = torch.optim.Adam(constraintor.parameters(), lr=args.lr, weight_decay=0.0005)
     scheduler0 = torch.optim.lr_scheduler.MultiStepLR(optimizer0, milestones=[70, 90], gamma=0.1)
     
@@ -156,21 +128,27 @@ def main(args):
     optimizer1 = torch.optim.Adam(params, lr=args.lr, weight_decay=0.0005)
     scheduler1 = torch.optim.lr_scheduler.MultiStepLR(optimizer1, milestones=[70, 90], gamma=0.1)
     
+    # SVD行列をキャッシュする辞書
+    osp_cache = {}
+    
+    from train import train
+    
     best_img_auc = 0
     N_batch = 8192
     for epoch in range(args.epochs):
-        if vq_ops is not None:
-            vq_ops.train()
         constraintor.train()
         for estimator in estimators:
             estimator.train()
+            
         if epoch < FIRST_STAGE_EPOCH:
             train_loader = train_loader1
         else:
             train_loader = train_loader2
+            
         train_loss_total, total_num = 0, 0
         progress_bar = tqdm(total=len(train_loader))
         progress_bar.set_description(f"Epoch[{epoch}/{args.epochs}]")
+        
         for step, batch in enumerate(train_loader):
             progress_bar.update(1)
             images, _, masks, class_names = batch
@@ -181,16 +159,26 @@ def main(args):
             with torch.no_grad():
                 features = encoder(images)
             
-            ref_features = get_mc_reference_features(
-                encoder,
-                args.train_dataset_dir,
-                class_names,
-                images.device,
-                args.train_ref_shot,
-                img_size=image_size,
-            )
+            ref_features = get_mc_reference_features(encoder, args.train_dataset_dir, class_names, images.device, args.train_ref_shot)
             mfeatures = get_mc_matched_ref_features(features, class_names, ref_features)
             rfeatures = get_residual_features(features, mfeatures, pos_flag=True)
+            
+            # --- OSPの適用 (クラスごとに計算・キャッシュしてバッチ内の該当スライスに適用) ---
+            rfeatures_osp = [torch.zeros_like(rf) for rf in rfeatures]
+            for i, c_name in enumerate(class_names):
+                if c_name not in osp_cache:
+                    c_refs = ref_features[c_name]
+                    osp_cache[c_name] = compute_osp_matrices(c_refs, keep_variance=0.95) # 0.95で95%のズレを吸収
+                
+                proj_matrices, means = osp_cache[c_name]
+                single_rfeat = [rf[i:i+1] for rf in rfeatures] 
+                single_rfeat_osp = apply_osp(single_rfeat, proj_matrices, means)
+                
+                for l in range(args.feature_levels):
+                    rfeatures_osp[l][i] = single_rfeat_osp[l][0]
+            
+            rfeatures = rfeatures_osp
+            # --------------------------------------------------------------------------
             
             lvl_masks = []
             for l in range(args.feature_levels):
@@ -199,17 +187,13 @@ def main(args):
                 lvl_masks.append(m)
             rfeatures_t = [rfeature.detach().clone() for rfeature in rfeatures]
             
-            if vq_ops is not None:
-                loss_vq = vq_ops(rfeatures, lvl_masks, train=True)
-                train_loss_total += loss_vq.item()
-                total_num += 1
-                optimizer_vq.zero_grad()
-                loss_vq.backward()
-                optimizer_vq.step()
-            
+            # constraintor適用
             rfeatures = constraintor(*rfeatures)
+   # 学習時のみ、特徴量に微小なノイズを付加して過学習を防ぐ
+            noise_std = 0.01  # ノイズの強さ（0.005 〜 0.05あたりで調整）
+            rfeatures_noisy = [rf + torch.randn_like(rf) * noise_std for rf in rfeatures]                 
             loss = 0
-            for l in range(args.feature_levels):  # backward svdd loss
+            for l in range(args.feature_levels):  
                 e = rfeatures[l]  
                 t = rfeatures_t[l]
                 bs, dim, h, w = e.size()
@@ -220,6 +204,7 @@ def main(args):
                 
                 loss_i, _, _ = calculate_log_barrier_bi_occ_loss(e, m, t)
                 loss += loss_i
+                
             optimizer0.zero_grad()
             loss.backward()
             optimizer0.step()
@@ -227,15 +212,11 @@ def main(args):
             train_loss_total += loss.item()
             total_num += 1
             
-            # detach the rfeatures for flow optimization
             rfeatures = [rfeature.detach().clone() for rfeature in rfeatures]
-            # train flow corresponding to with neck
             loss, num = train(args, rfeatures, estimators, optimizer1, masks, boundary_ops, epoch, N_batch=N_batch, FIRST_STAGE_EPOCH=FIRST_STAGE_EPOCH)
             train_loss_total += loss
             total_num += num
         
-        if scheduler_vq is not None:
-            scheduler_vq.step()
         scheduler0.step()
         scheduler1.step()
                
@@ -245,45 +226,36 @@ def main(args):
         if (epoch + 1) % args.eval_freq == 0:
             s1_res, s2_res, s_res = [], [], []
             test_ref_features = load_mc_reference_features(args.test_ref_feature_dir, CLASSES['unseen'], args.device, args.num_ref_shot)
+            
             for class_name in CLASSES['unseen']:
+                if class_name not in osp_cache: # 評価時のOSP行列をキャッシュ
+                    osp_cache[class_name] = compute_osp_matrices(test_ref_features[class_name], keep_variance=0.95)
+                proj_matrices, means = osp_cache[class_name]
+                
                 if args.classes == 'capsules':
-                    test_dataset = CAPSULES(args.test_dataset_dir, class_name=class_name, train=False,
-                                         normalize='w50',
-                                         img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = CAPSULES(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)                            
                 elif class_name in MVTEC.CLASS_NAMES:
-                    test_dataset = MVTEC(args.test_dataset_dir, class_name=class_name, train=False,
-                                         normalize='w50',
-                                         img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = MVTEC(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in VISA.CLASS_NAMES:
-                    test_dataset = VISA(args.test_dataset_dir, class_name=class_name, train=False,
-                                        normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = VISA(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in BTAD.CLASS_NAMES:
-                    test_dataset = BTAD(args.test_dataset_dir, class_name=class_name, train=False,
-                                        normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = BTAD(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MVTEC3D.CLASS_NAMES:
-                    test_dataset = MVTEC3D(args.test_dataset_dir, class_name=class_name, train=False,
-                                           normalize='w50',
-                                           img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = MVTEC3D(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MPDD.CLASS_NAMES:
-                    test_dataset = MPDD(args.test_dataset_dir, class_name=class_name, train=False,
-                                        normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = MPDD(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MVTECLOCO.CLASS_NAMES:
-                    test_dataset = MVTECLOCO(args.test_dataset_dir, class_name=class_name, train=False,
-                                        normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = MVTECLOCO(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in BRATS.CLASS_NAMES:
-                    test_dataset = BRATS(args.test_dataset_dir, class_name=class_name, train=False,
-                                           normalize='w50',
-                                           img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                    test_dataset = BRATS(args.test_dataset_dir, class_name=class_name, train=False, normalize='w50', img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 else:
                     raise ValueError('Unrecognized class name: {}'.format(class_name))
-                test_loader = DataLoader(
-                    test_dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False
-                )
-                metrics = validate(args, encoder, vq_ops, constraintor, estimators, test_loader, test_ref_features[class_name], args.device, class_name)
+                
+                test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=8, drop_last=False)
+                
+                # validate_osp の validate 関数を呼び出し (proj_matrices, means を渡す)
+                metrics = validate(args, encoder, constraintor, estimators, test_loader, test_ref_features[class_name], args.device, class_name, proj_matrices, means)
+                
                 img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro = metrics['scores']
                 
                 print("Epoch: {}, Class Name: {}, Image AUC | AP | F1_Score: {} | {} | {}, Pixel AUC | AP | F1_Score | AUPRO: {} | {} | {} | {}".format(
@@ -303,18 +275,13 @@ def main(args):
             print('(BScores) Average Image AUC | AP | F1_Score: {:.3f} | {:.3f} | {:.3f}, Average Pixel AUC | AP | F1_Score | AUPRO: {:.3f} | {:.3f} | {:.3f} | {:.3f}'.format(
                 img_auc2, img_ap2, img_f1_score2, pix_auc2, pix_ap2, pix_f1_score2, pix_aupro2))
             print('(Merged) Average Image AUC | AP | F1_Score: {:.3f} | {:.3f} | {:.3f}, Average Pixel AUC | AP | F1_Score | AUPRO: {:.3f} | {:.3f} | {:.3f} | {:.3f}'.format(
-                img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro))
-            
+                img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro))            
             if img_auc > best_img_auc:
                 os.makedirs(args.checkpoint_path, exist_ok=True)
                 best_img_auc = img_auc
                 state_dict = {'constraintor': constraintor.state_dict(),
                               'estimators': [estimator.state_dict() for estimator in estimators]}
-                if vq_ops is not None:
-                    state_dict['vq_ops'] = vq_ops.state_dict()
                 torch.save(state_dict, os.path.join(args.checkpoint_path, f'{args.setting}_epoch_{epoch}_checkpoints.pth'))
-                #torch.save(state_dict, os.path.join(args.checkpoint_path, f'{args.setting}_checkpoints.pth'))
-
 
 def load_mc_reference_features(root_dir: str, class_names, device: torch.device, num_shot=4):
     refs = {}
@@ -335,9 +302,7 @@ def load_mc_reference_features(root_dir: str, class_names, device: torch.device,
         layer3_refs = layer3_refs[:K3, :]
         
         refs[class_name] = (layer1_refs, layer2_refs, layer3_refs)
-    
     return refs
-                    
                     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -346,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_dataset_dir', type=str, default="")
     parser.add_argument('--test_dataset_dir', type=str, default="")
     parser.add_argument('--test_ref_feature_dir', type=str, default="./ref_features/w50/mvtec_4shot")
-    parser.add_argument('--bgadweight_dir', type=str, default="none")# 12/16追加    
+    parser.add_argument('--bgadweight_dir', type=str, default="none")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--epochs', type=int, default=100)
@@ -354,13 +319,6 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_path', type=str, default="./checkpoints/")
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--backbone', type=str, default="wide_resnet50_2")
-    parser.add_argument('--feature_backbone', type=str, default="original", choices=["original", "clip_raw"])
-    parser.add_argument('--clip_model', type=str, default="ViT-L-14-336")
-    parser.add_argument('--clip_pretrained', type=str, default="openai")
-    parser.add_argument('--clip_weight_source', type=str, default="open_clip", choices=["open_clip", "openai_local"])
-    parser.add_argument('--clip_checkpoint', type=str, default="")
-    parser.add_argument('--clip_layers', type=int, nargs="+", default=[6, 12, 24])
-    parser.add_argument('--clip_image_size', type=int, default=518)
     parser.add_argument('--rank', type=int, default="0")    
     
     # flow parameters
@@ -373,14 +331,9 @@ if __name__ == "__main__":
     parser.add_argument('--margin_tau', type=float, default=0.1)
     parser.add_argument('--bgspp_lambda', type=float, default=1)
     
-    parser.add_argument('--fdm_alpha', type=float, default=0.4)  # low value, more training distribution
-    parser.add_argument('--num_embeddings', type=int, default=1536)  # VQ embeddings
-    parser.add_argument('--disable_vqops', action='store_true')
     parser.add_argument("--train_ref_shot", type=int, default=4)
     parser.add_argument("--num_ref_shot", type=int, default=4)
     
     args = parser.parse_args()
     init_seeds(42)
-    
     main(args)
-            

@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from train import train
-from validate import validate
+from validate_ada import validate
 from datasets.mvtec import MVTEC, MVTECANO
 from datasets.visa import VISA, VISAANO
 from datasets.btad import BTAD
@@ -23,6 +23,7 @@ from models.fc_flow import load_flow_model
 from models.modules import MultiScaleConv
 from models.vq import MultiScaleVQ
 from models.clip_feature_extractor import CLIPRawFeatureExtractor
+from models.adaclip_feature_extractor import AdaCLIPPromptedFeatureExtractor
 from utils import init_seeds, get_residual_features, get_mc_matched_ref_features, get_mc_reference_features
 from utils import BoundaryAverager
 from losses.loss import calculate_log_barrier_bi_occ_loss
@@ -42,15 +43,16 @@ SETTINGS = {'visa_to_mvtec': VISA_TO_MVTEC, 'mvtec_to_visa': MVTEC_TO_VISA,
 
 
 def get_feature_image_size(args):
-    if args.feature_backbone == "clip_raw":
+    if args.feature_backbone in ("clip_raw", "adaclip_prompted"):
         return args.clip_image_size
     return 224
 
 
 def build_feature_encoder(args):
+    if args.feature_backbone in ("clip_raw", "adaclip_prompted") and len(args.clip_layers) != 3:
+        raise ValueError(f"{args.feature_backbone} currently expects exactly 3 clip_layers for ResAD multi-level features.")
+
     if args.feature_backbone == "clip_raw":
-        if len(args.clip_layers) != 3:
-            raise ValueError("clip_raw currently expects exactly 3 clip_layers for ResAD multi-level features.")
         encoder = CLIPRawFeatureExtractor(
             model_name=args.clip_model,
             pretrained=args.clip_pretrained,
@@ -59,6 +61,23 @@ def build_feature_encoder(args):
             freeze=True,
             weight_source=args.clip_weight_source,
             checkpoint=args.clip_checkpoint,
+        ).to(args.device)
+        encoder.eval()
+        return encoder, encoder.feature_info.channels()
+
+    if args.feature_backbone == "adaclip_prompted":
+        encoder = AdaCLIPPromptedFeatureExtractor(
+            adaclip_repo_url=args.adaclip_repo_url,
+            adaclip_repo_path=args.adaclip_repo_path,
+            checkpoint=args.adaclip_checkpoint,
+            checkpoint_url=args.adaclip_checkpoint_url,
+            cache_dir=args.adaclip_cache_dir,
+            model_name=args.adaclip_model,
+            layers=args.clip_layers,
+            image_size=args.clip_image_size,
+            return_projected=args.adaclip_return_projected,
+            freeze=True,
+            device=args.device,
         ).to(args.device)
         encoder.eval()
         return encoder, encoder.feature_info.channels()
@@ -86,27 +105,27 @@ def main(args):
     image_size = get_feature_image_size(args)
 
     if args.classes == 'capsules':  # from mvtec to other datasets  # from mvtec to other datasets
-        train_dataset1 = CAPSULES(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
+        train_dataset1 = CAPSULES(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                normalize="w50",
                                img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
-        train_dataset2 = CAPSULESANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
+        train_dataset2 = CAPSULESANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                   normalize='w50',
                                   img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
         train_loader2 = DataLoader(
             train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
-        )    
-    
+        )
+
     elif CLASSES['seen'][0] in MVTEC.CLASS_NAMES:  # from mvtec to other datasets
-        train_dataset1 = MVTEC(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
+        train_dataset1 = MVTEC(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                normalize="w50",
                                img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
-        train_dataset2 = MVTECANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
+        train_dataset2 = MVTECANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                   normalize='w50',
                                   img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
         train_loader2 = DataLoader(
@@ -119,7 +138,7 @@ def main(args):
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
-        train_dataset2 = VISAANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
+        train_dataset2 = VISAANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                  normalize="w50",
                                  img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
         train_loader2 = DataLoader(
@@ -129,7 +148,7 @@ def main(args):
     if len(feat_dims) != args.feature_levels:
         raise ValueError(
             f"feature_levels={args.feature_levels} does not match encoder outputs {len(feat_dims)}. "
-            "For clip_raw, keep --feature_levels 3 with the default three --clip_layers."
+            "For CLIP-based backbones, keep --feature_levels 3 with the default three --clip_layers."
         )
     boundary_ops = BoundaryAverager(num_levels=args.feature_levels)
     use_vqops = not args.disable_vqops
@@ -141,12 +160,12 @@ def main(args):
         vq_ops = MultiScaleVQ(num_embeddings=args.num_embeddings, channels=feat_dims).to(args.device)
         optimizer_vq = torch.optim.Adam(vq_ops.parameters(), lr=args.lr, weight_decay=0.0005)
         scheduler_vq = torch.optim.lr_scheduler.MultiStepLR(optimizer_vq, milestones=[70, 90], gamma=0.1)
-    
+
     constraintor = MultiScaleConv(feat_dims).to(args.device)
     # weight_decay is the l2 weight penalty lambda, weight_decay = lambda / 2
     optimizer0 = torch.optim.Adam(constraintor.parameters(), lr=args.lr, weight_decay=0.0005)
     scheduler0 = torch.optim.lr_scheduler.MultiStepLR(optimizer0, milestones=[70, 90], gamma=0.1)
-    
+
     # Normflow decoder
     estimators = [load_flow_model(args, feat_dim) for feat_dim in feat_dims]
     estimators = [decoder.to(args.device) for decoder in estimators]
@@ -155,7 +174,7 @@ def main(args):
         params += list(estimators[l].parameters())
     optimizer1 = torch.optim.Adam(params, lr=args.lr, weight_decay=0.0005)
     scheduler1 = torch.optim.lr_scheduler.MultiStepLR(optimizer1, milestones=[70, 90], gamma=0.1)
-    
+
     best_img_auc = 0
     N_batch = 8192
     for epoch in range(args.epochs):
@@ -174,13 +193,13 @@ def main(args):
         for step, batch in enumerate(train_loader):
             progress_bar.update(1)
             images, _, masks, class_names = batch
-            
+
             images = images.to(args.device)
             masks = masks.to(args.device)
-            
+
             with torch.no_grad():
                 features = encoder(images)
-            
+
             ref_features = get_mc_reference_features(
                 encoder,
                 args.train_dataset_dir,
@@ -191,14 +210,14 @@ def main(args):
             )
             mfeatures = get_mc_matched_ref_features(features, class_names, ref_features)
             rfeatures = get_residual_features(features, mfeatures, pos_flag=True)
-            
+
             lvl_masks = []
             for l in range(args.feature_levels):
                 _, _, h, w = rfeatures[l].size()
                 m = F.interpolate(masks, size=(h, w), mode='nearest').squeeze(1)
                 lvl_masks.append(m)
             rfeatures_t = [rfeature.detach().clone() for rfeature in rfeatures]
-            
+
             if vq_ops is not None:
                 loss_vq = vq_ops(rfeatures, lvl_masks, train=True)
                 train_loss_total += loss_vq.item()
@@ -206,42 +225,42 @@ def main(args):
                 optimizer_vq.zero_grad()
                 loss_vq.backward()
                 optimizer_vq.step()
-            
+
             rfeatures = constraintor(*rfeatures)
             loss = 0
             for l in range(args.feature_levels):  # backward svdd loss
-                e = rfeatures[l]  
+                e = rfeatures[l]
                 t = rfeatures_t[l]
                 bs, dim, h, w = e.size()
                 e = e.permute(0, 2, 3, 1).reshape(-1, dim)
                 t = t.permute(0, 2, 3, 1).reshape(-1, dim)
                 m = lvl_masks[l]
                 m = m.reshape(-1)
-                
+
                 loss_i, _, _ = calculate_log_barrier_bi_occ_loss(e, m, t)
                 loss += loss_i
             optimizer0.zero_grad()
             loss.backward()
             optimizer0.step()
-            
+
             train_loss_total += loss.item()
             total_num += 1
-            
+
             # detach the rfeatures for flow optimization
             rfeatures = [rfeature.detach().clone() for rfeature in rfeatures]
             # train flow corresponding to with neck
             loss, num = train(args, rfeatures, estimators, optimizer1, masks, boundary_ops, epoch, N_batch=N_batch, FIRST_STAGE_EPOCH=FIRST_STAGE_EPOCH)
             train_loss_total += loss
             total_num += num
-        
+
         if scheduler_vq is not None:
             scheduler_vq.step()
         scheduler0.step()
         scheduler1.step()
-               
+
         progress_bar.close()
         print(f"Epoch[{epoch}/{args.epochs}]: train_loss: {train_loss_total / total_num}")
-        
+
         if (epoch + 1) % args.eval_freq == 0:
             s1_res, s2_res, s_res = [], [], []
             test_ref_features = load_mc_reference_features(args.test_ref_feature_dir, CLASSES['unseen'], args.device, args.num_ref_shot)
@@ -285,13 +304,13 @@ def main(args):
                 )
                 metrics = validate(args, encoder, vq_ops, constraintor, estimators, test_loader, test_ref_features[class_name], args.device, class_name)
                 img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro = metrics['scores']
-                
+
                 print("Epoch: {}, Class Name: {}, Image AUC | AP | F1_Score: {} | {} | {}, Pixel AUC | AP | F1_Score | AUPRO: {} | {} | {} | {}".format(
                     epoch, class_name, img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro))
                 s1_res.append(metrics['scores1'])
                 s2_res.append(metrics['scores2'])
                 s_res.append(metrics['scores'])
-            
+
             s1_res = np.array(s1_res)
             s2_res = np.array(s2_res)
             s_res = np.array(s_res)
@@ -304,7 +323,7 @@ def main(args):
                 img_auc2, img_ap2, img_f1_score2, pix_auc2, pix_ap2, pix_f1_score2, pix_aupro2))
             print('(Merged) Average Image AUC | AP | F1_Score: {:.3f} | {:.3f} | {:.3f}, Average Pixel AUC | AP | F1_Score | AUPRO: {:.3f} | {:.3f} | {:.3f} | {:.3f}'.format(
                 img_auc, img_ap, img_f1_score, pix_auc, pix_ap, pix_f1_score, pix_aupro))
-            
+
             if img_auc > best_img_auc:
                 os.makedirs(args.checkpoint_path, exist_ok=True)
                 best_img_auc = img_auc
@@ -322,23 +341,33 @@ def load_mc_reference_features(root_dir: str, class_names, device: torch.device,
         layer1_refs = np.load(os.path.join(root_dir, class_name, 'layer1.npy'))
         layer2_refs = np.load(os.path.join(root_dir, class_name, 'layer2.npy'))
         layer3_refs = np.load(os.path.join(root_dir, class_name, 'layer3.npy'))
-        
+
         layer1_refs = torch.from_numpy(layer1_refs).to(device)
         layer2_refs = torch.from_numpy(layer2_refs).to(device)
         layer3_refs = torch.from_numpy(layer3_refs).to(device)
-        
+
         K1 = (layer1_refs.shape[0] // TOTAL_SHOT) * num_shot
         layer1_refs = layer1_refs[:K1, :]
         K2 = (layer2_refs.shape[0] // TOTAL_SHOT) * num_shot
         layer2_refs = layer2_refs[:K2, :]
         K3 = (layer3_refs.shape[0] // TOTAL_SHOT) * num_shot
         layer3_refs = layer3_refs[:K3, :]
-        
+
         refs[class_name] = (layer1_refs, layer2_refs, layer3_refs)
-    
+
     return refs
-                    
-                    
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    value = v.lower()
+    if value in ("yes", "true", "t", "1"):
+        return True
+    if value in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--setting', type=str, default="visa_to_mvtec")
@@ -346,7 +375,7 @@ if __name__ == "__main__":
     parser.add_argument('--train_dataset_dir', type=str, default="")
     parser.add_argument('--test_dataset_dir', type=str, default="")
     parser.add_argument('--test_ref_feature_dir', type=str, default="./ref_features/w50/mvtec_4shot")
-    parser.add_argument('--bgadweight_dir', type=str, default="none")# 12/16追加    
+    parser.add_argument('--bgadweight_dir', type=str, default="none")# 12/16追加
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--epochs', type=int, default=100)
@@ -354,15 +383,22 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_path', type=str, default="./checkpoints/")
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--backbone', type=str, default="wide_resnet50_2")
-    parser.add_argument('--feature_backbone', type=str, default="original", choices=["original", "clip_raw"])
+    parser.add_argument('--feature_backbone', type=str, default="adaclip_prompted", choices=["adaclip_prompted"])
     parser.add_argument('--clip_model', type=str, default="ViT-L-14-336")
     parser.add_argument('--clip_pretrained', type=str, default="openai")
     parser.add_argument('--clip_weight_source', type=str, default="open_clip", choices=["open_clip", "openai_local"])
     parser.add_argument('--clip_checkpoint', type=str, default="")
     parser.add_argument('--clip_layers', type=int, nargs="+", default=[6, 12, 24])
-    parser.add_argument('--clip_image_size', type=int, default=518)
-    parser.add_argument('--rank', type=int, default="0")    
-    
+    parser.add_argument('--clip_image_size', type=int, default=336)
+    parser.add_argument('--adaclip_repo_url', type=str, default="https://github.com/tomo082/AdaCLIP_res")
+    parser.add_argument('--adaclip_repo_path', type=str, default="")
+    parser.add_argument('--adaclip_checkpoint', type=str, default="")
+    parser.add_argument('--adaclip_checkpoint_url', type=str, default="")
+    parser.add_argument('--adaclip_cache_dir', type=str, default="~/.cache/adaclip_res")
+    parser.add_argument('--adaclip_model', type=str, default="ViT-L-14-336")
+    parser.add_argument('--adaclip_return_projected', type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument('--rank', type=int, default="0")
+
     # flow parameters
     parser.add_argument('--flow_arch', type=str, default='conditional_flow_model')
     parser.add_argument('--feature_levels', default=3, type=int)
@@ -372,15 +408,14 @@ if __name__ == "__main__":
     parser.add_argument('--pos_beta', type=float, default=0.05)
     parser.add_argument('--margin_tau', type=float, default=0.1)
     parser.add_argument('--bgspp_lambda', type=float, default=1)
-    
+
     parser.add_argument('--fdm_alpha', type=float, default=0.4)  # low value, more training distribution
     parser.add_argument('--num_embeddings', type=int, default=1536)  # VQ embeddings
     parser.add_argument('--disable_vqops', action='store_true')
     parser.add_argument("--train_ref_shot", type=int, default=4)
     parser.add_argument("--num_ref_shot", type=int, default=4)
-    
+
     args = parser.parse_args()
     init_seeds(42)
-    
+
     main(args)
-            

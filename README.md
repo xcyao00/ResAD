@@ -39,6 +39,105 @@ python extract_ref_features.py --dataset visa --few_shot_dir ./data/4shot/visa -
 python extract_ref_features.py --dataset mvtec3d --few_shot_dir ./data/4shot/mvtec3d --save_dir ./ref_features/w50/mvtec3d_4shot
 ```
 
+### CLIP Raw Patch Features
+
+The default ResAD feature extractor remains unchanged. To compare against frozen
+pretrained CLIP raw patch features, set `--feature_backbone clip_raw`. This uses
+`open_clip` image-encoder transformer block outputs directly; no AdaCLIP prompt,
+projection, text similarity, or HSF feature is used.
+
+Example reference feature extraction for one MVTec class:
+```bash
+CUDA_VISIBLE_DEVICES=0 python extract_ref_features.py \
+  --dataset mvtec \
+  --class_name screw \
+  --dataset_dir /path/to/mvtec \
+  --output_dir ./ref_features/clip_raw/mvtec_screw_4shot \
+  --feature_backbone clip_raw \
+  --clip_model ViT-L-14-336 \
+  --clip_weight_source openai_local \
+  --clip_layers 6 12 24 \
+  --clip_image_size 518
+```
+
+Example training/evaluation with CLIP raw features:
+```bash
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --setting mvtec_to_mvtec \
+  --train_dataset_dir /path/to/mvtec \
+  --test_dataset_dir /path/to/mvtec \
+  --test_ref_feature_dir ./ref_features/clip_raw/mvtec_screw_4shot \
+  --feature_backbone clip_raw \
+  --clip_model ViT-L-14-336 \
+  --clip_weight_source openai_local \
+  --clip_layers 6 12 24 \
+  --clip_image_size 518 \
+  --disable_vqops \
+  --num_ref_shot 4 \
+  --device cuda:0
+```
+
+`--clip_layers` are 1-indexed transformer block numbers. The default
+`6 12 24` captures three raw patch-token feature maps and reshapes them from
+`[B, N, C]` to `[B, C, H, W]`.
+`--clip_weight_source openai_local` downloads OpenAI CLIP `.pt` weights into
+`~/.cache/clip` and reuses the cached file on later runs, avoiding the Hugging
+Face Hub `open_clip_model.safetensors` path. You can also pass
+`--clip_checkpoint /path/to/ViT-L-14-336px.pt` to use an existing local file.
+`--disable_vqops` skips VQOps training and EFDM application so CLIP raw features
+can be evaluated without the ResAD++ VQ branch. Omit it to keep the original
+ResAD behavior.
+
+### AdaCLIP Prompted Patch Features
+
+Use `main_ada.py` and `extract_ref_features_ada.py` for AdaCLIP prompted
+feature experiments. The default `main.py`, `validate.py`, and
+`extract_ref_features.py` remain unchanged for normal ResAD runs. AdaCLIP
+checkpoints are not stored in this repository; pass either a local checkpoint or
+a GitHub Releases URL so it can be cached under `~/.cache/adaclip_res`.
+
+Example reference feature extraction:
+```bash
+CUDA_VISIBLE_DEVICES=0 python extract_ref_features_ada.py \
+  --dataset mvtec \
+  --class_name screw \
+  --dataset_dir /path/to/mvtec \
+  --output_dir ./ref_features/adaclip_prompted_336/mvtec_screw_4shot \
+  --feature_backbone adaclip_prompted \
+  --adaclip_repo_url https://github.com/tomo082/AdaCLIP_res \
+  --adaclip_checkpoint_url https://github.com/tomo082/AdaCLIP_res/releases/download/<tag>/<weight>.pth \
+  --adaclip_cache_dir ~/.cache/adaclip_res \
+  --adaclip_model ViT-L-14-336 \
+  --clip_layers 6 12 24 \
+  --clip_image_size 336 \
+  --device cuda:0
+```
+
+Example training/evaluation:
+```bash
+CUDA_VISIBLE_DEVICES=0 python main_ada.py \
+  --setting mvtec_to_mvtec \
+  --train_dataset_dir /path/to/mvtec \
+  --test_dataset_dir /path/to/mvtec \
+  --test_ref_feature_dir ./ref_features/adaclip_prompted_336/mvtec_screw_4shot \
+  --feature_backbone adaclip_prompted \
+  --adaclip_repo_url https://github.com/tomo082/AdaCLIP_res \
+  --adaclip_checkpoint_url https://github.com/tomo082/AdaCLIP_res/releases/download/<tag>/<weight>.pth \
+  --adaclip_cache_dir ~/.cache/adaclip_res \
+  --adaclip_model ViT-L-14-336 \
+  --clip_layers 6 12 24 \
+  --clip_image_size 336 \
+  --feature_levels 3 \
+  --disable_vqops \
+  --num_ref_shot 4 \
+  --device cuda:0
+```
+
+The AdaCLIP fork must expose `extract_prompted_features(images, layers,
+return_projected=False)` on its AdaCLIP model. The returned prompted patch maps
+are saved as `layer1.npy`, `layer2.npy`, and `layer3.npy`, matching the existing
+reference-feature layout.
+
 
 ## Training and Evaluating
 In this repository, we use ``wide_resnet50`` as the feature extractor by default.

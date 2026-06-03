@@ -37,3 +37,18 @@ MVTEC_TO_BRATS = {'seen': ['bottle', 'cable', 'capsule', 'carpet', 'grid',
                              'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
                              'tile', 'toothbrush', 'transistor', 'wood', 'zipper'],
                  'unseen': ['brain']}
+
+MVTEC_TO_MVTEC = {'seen': ['bottle', 'cable', 'capsule', 'carpet', 'grid',
+'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
+'tile', 'toothbrush', 'transistor', 'wood', 'zipper'],
+'unseen': ['bottle', 'cable', 'capsule', 'carpet', 'grid',
+'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
+'tile', 'toothbrush', 'transistor', 'wood', 'zipper']}
+
+VISA_TO_VISA = {'seen': ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum',
+'macaroni1', 'macaroni2', 'pcb1', 'pcb2', 'pcb3', 'pcb4', 'pipe_fryum'],
+'unseen': ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum',
+'macaroni1', 'macaroni2', 'pcb1', 'pcb2', 'pcb3', 'pcb4', 'pipe_fryum']}
+
+CAPSULES_TO_CAPSULES = {'seen': ['capsules'],
+                 'unseen': ['capsules']}

@@ -25,7 +25,7 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-class MVTECANO(Dataset):
+class MVTECFEWANO(Dataset):
     """This dataset is used for cross-class training, where we use all the normal and abnomal
     samples for training. As we will not test on the training classes, using abnormal samples
     in test set is actually reasonable.
@@ -44,9 +44,7 @@ class MVTECANO(Dataset):
 
     MVTEC_URL = 'ftp://guest:GU.205dldo@ftp.softronics.ch/mvtec_anomaly_detection/mvtec_anomaly_detection.tar.xz'
     
-    CLASS_NAMES = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
-               'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
-               'tile', 'toothbrush', 'transistor', 'wood', 'zipper']
+    CLASS_NAMES = ['capsule','screw','transistor']
 
     def __init__(
             self, 
@@ -99,14 +97,8 @@ class MVTECANO(Dataset):
             T.CenterCrop(kwargs.get('msk_crp_size')),
             T.ToTensor()])
             
-        self.class_to_idx = {'bottle': 0, 'cable': 1, 'capsule': 2, 'carpet': 3,
-                'grid': 4, 'hazelnut': 5, 'leather': 6, 'metal_nut': 7,
-                'pill': 8, 'screw': 9, 'tile': 10, 'toothbrush': 11,
-                'transistor': 12, 'wood': 13, 'zipper': 14}
-        self.idx_to_class = {0: 'bottle', 1: 'cable', 2: 'capsule', 3: 'carpet',
-                        4: 'grid', 5: 'hazelnut', 6: 'leather', 7: 'metal_nut',
-                        8: 'pill', 9: 'screw', 10: 'tile', 11: 'toothbrush',
-                        12: 'transistor', 13: 'wood', 14: 'zipper'}
+        self.class_to_idx = {'capsule': 0,'screw': 1, 'toothbrush': 2}
+        self.idx_to_class = { 0: 'capsule', 1: 'screw', 2: 'transistor'}
     
     def __getitem__(self, idx):
         image_path, label, mask_path, class_name,anomaly_type = self.image_paths[idx], self.labels[idx], self.mask_paths[idx], self.class_names[idx],self.anomaly_types[idx]
@@ -189,14 +181,12 @@ class MVTECANO(Dataset):
         return all_image_paths, all_labels, all_mask_paths, all_class_names, all_anomaly_types # anomaly_types も返す
 
 
-class MVTEC(Dataset):
+class MVTECFEW(Dataset):
     
-    CLASS_NAMES = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
-               'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
-               'tile', 'toothbrush', 'transistor', 'wood', 'zipper']
+    CLASS_NAMES = ['capsule','screw','transistor']
     def __init__(self, 
                  root: str,
-                 class_name: str = 'bottle', 
+                 class_name: str = 'capsule', 
                  train: bool = True,
                  normalize: str = 'imagebind',
                  **kwargs) -> None:

@@ -1,0 +1,5 @@
+ResADの場合、例えばmvtecでtestする場合、visaの全データを用いてtrainしている。このときtrainをnormal+dataaug anomalt or normal + anomaly + dataaug anomalyにする?
+fewshotなので他のデータセットのクラスの異常にも対応できるようにしたいcutpasteよりはdream?dreamを物体があるに場所しか適応できないように変える。maskのデータはあるからperlinnoiseを生成してそこから絞り込み。
+NSA: cutpasteの応用、コピー元が正常画像、切り取った画像をノイズやブレンドなどを行い異常風に生成、それをほかの正常画像にはりつける。
+SPADEの設定を適応するにはどうするか?
+新しいテスト用のデータセットを作る

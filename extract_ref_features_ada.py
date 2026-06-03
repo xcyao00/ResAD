@@ -22,6 +22,7 @@ from models.imagebind import ImageBindModel
 from models.dinov2_backbone import DINOv2BackboneWrapper, DINOV2_BACKBONES, DINOV2_FEATURE_MODES
 from models.dinov2_backbone import print_dinov2_config
 from models.clip_feature_extractor import CLIPRawFeatureExtractor
+from models.adaclip_feature_extractor import AdaCLIPPromptedFeatureExtractor
 from residual_wavelet import apply_feature_wavelet_filter
 from utils import load_weights
 
@@ -58,13 +59,13 @@ def rotate_rgb_image(img, angle, fill_mode="reflect"):
 
 
 class FEWSHOTDATA(Dataset):
-    
-    def __init__(self, 
+
+    def __init__(self,
                  root: str,
-                 class_name: str = 'bottle', 
+                 class_name: str = 'bottle',
                  train: bool = True,
                  **kwargs) -> None:
-    
+
         self.root = root
         self.class_name = class_name
         self.train = train
@@ -76,22 +77,22 @@ class FEWSHOTDATA(Dataset):
             raise ValueError(f"Unsupported ref_aug: {self.ref_aug}")
         if not self.ref_aug_angles:
             raise ValueError("ref_aug_angles must contain at least one angle.")
-        
+
         self.image_paths, self.labels, self.mask_paths, self.class_names = self._load_data(self.class_name)
-    
+
         # set transforms
         self.transform = T.Compose([
             T.Resize(kwargs.get('img_size', 224), T.InterpolationMode.BICUBIC),
             T.CenterCrop(kwargs.get('crp_size', 224)),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        
+
         # mask
         self.target_transform = T.Compose([
             T.Resize(kwargs.get('msk_size', 256), T.InterpolationMode.NEAREST),
             T.CenterCrop(kwargs.get('msk_crp_size', 256)),
             T.ToTensor()])
-    
+
     def __len__(self):
         if self.ref_aug == "rotate":
             return len(self.image_paths) * len(self.ref_aug_angles)
@@ -110,28 +111,28 @@ class FEWSHOTDATA(Dataset):
         mask_path = self.mask_paths[image_idx]
         class_name = self.class_names[image_idx]
         img, label, mask = self._load_image_and_mask(image_path, label, mask_path, angle=angle)
-        
+
         return img, label, mask, class_name
-    
+
     def _load_image_and_mask(self, image_path, label, mask_path, angle=None):
         img = Image.open(image_path).convert('RGB')
         if angle is not None:
             img = rotate_rgb_image(img, angle, fill_mode=self.ref_aug_fill)
-       
+
         img = self.transform(img)
-        
+
         if label == 0:
             mask = torch.zeros([1, self.mask_size[0], self.mask_size[1]])
         else:
             mask = Image.open(mask_path)
             mask = self.target_transform(mask)
-        
+
         return img, label, mask
 
     def _load_data(self, class_name):
         image_paths, labels, mask_paths = [], [], []
         phase = 'train' if self.train else 'test'
-        
+
         image_dir = os.path.join(self.root, class_name, phase)
         mask_dir = os.path.join(self.root, class_name, 'ground_truth')
 
@@ -156,10 +157,10 @@ class FEWSHOTDATA(Dataset):
                 gt_fpath_list = [os.path.join(gt_type_dir, img_fname + '_mask.png')
                                 for img_fname in img_fname_list]
                 mask_paths.extend(gt_fpath_list)
-                    
+
         class_names = [class_name] * len(image_paths)
         return image_paths, labels, mask_paths, class_names
-    
+
 
 SETTINGS = {'mvtec': MVTEC.CLASS_NAMES, 'visa': VISA.CLASS_NAMES,
             'btad': BTAD.CLASS_NAMES, 'mvtec3d': MVTEC3D.CLASS_NAMES,
@@ -188,15 +189,16 @@ def print_wavelet_config(args):
 
 
 def get_feature_image_size(args):
-    if args.feature_backbone == "clip_raw":
+    if args.feature_backbone in ("clip_raw", "adaclip_prompted"):
         return args.clip_image_size
     return 224
 
 
 def build_feature_encoder(args, device):
+    if args.feature_backbone in ("clip_raw", "adaclip_prompted") and len(args.clip_layers) != 3:
+        raise ValueError(f"{args.feature_backbone} currently expects exactly 3 clip_layers for ResAD reference features.")
+
     if args.feature_backbone == "clip_raw":
-        if len(args.clip_layers) != 3:
-            raise ValueError("clip_raw currently expects exactly 3 clip_layers for ResAD reference features.")
         encoder = CLIPRawFeatureExtractor(
             model_name=args.clip_model,
             pretrained=args.clip_pretrained,
@@ -205,6 +207,23 @@ def build_feature_encoder(args, device):
             freeze=True,
             weight_source=args.clip_weight_source,
             checkpoint=args.clip_checkpoint,
+        ).to(device)
+        encoder.eval()
+        return encoder
+
+    if args.feature_backbone == "adaclip_prompted":
+        encoder = AdaCLIPPromptedFeatureExtractor(
+            adaclip_repo_url=args.adaclip_repo_url,
+            adaclip_repo_path=args.adaclip_repo_path,
+            checkpoint=args.adaclip_checkpoint,
+            checkpoint_url=args.adaclip_checkpoint_url,
+            cache_dir=args.adaclip_cache_dir,
+            model_name=args.adaclip_model,
+            layers=args.clip_layers,
+            image_size=args.clip_image_size,
+            return_projected=args.adaclip_return_projected,
+            freeze=True,
+            device=device,
         ).to(device)
         encoder.eval()
         return encoder
@@ -248,10 +267,10 @@ def main(args):
     print_wavelet_config(args)
     # TODO: Consider adding a DINOv2-specific normalization option and compare it with the existing reference transform.
     encoder = build_feature_encoder(args, device)
-    feat_dims = encoder.feature_info.channels()    
+    feat_dims = encoder.feature_info.channels()
     decoders = [load_flow_model(args, feat_dim) for feat_dim in feat_dims]
     decoders = [decoder.to(args.device) for decoder in decoders]
-    
+
     if args.bgadweight_dir:
         load_weights(encoder, decoders, args.bgadweight_dir)
     if args.class_name:
@@ -260,7 +279,7 @@ def main(args):
         CLASS_NAMES = SETTINGS[args.dataset]
     else:
         raise ValueError(f"Dataset setting must be in {SETTINGS.keys()}, but got {args.dataset}.")
-    
+
     for class_name in CLASS_NAMES:
         train_dataset = FEWSHOTDATA(root_dir, class_name=class_name, train=True, img_size=image_size, crp_size=image_size,
                             msk_size=image_size, msk_crp_size=image_size, ref_aug=args.ref_aug,
@@ -274,7 +293,7 @@ def main(args):
             train_dataset, batch_size=8, shuffle=False, num_workers=8, drop_last=False
         )
         layer_features = None
-        
+
         for batch in tqdm.tqdm(train_loader):
             images, _, _, _ = batch
             with torch.no_grad():
@@ -295,12 +314,12 @@ def main(args):
             flattened_features.append(flattened)
 
         os.makedirs(os.path.join(save_dir, class_name), exist_ok=True)
-        
+
         print(f"Attempting to save layer1.npy for {class_name}...")
         for layer_id, features in enumerate(flattened_features):
             np.save(os.path.join(save_dir, class_name, f'layer{layer_id + 1}.npy'), features.cpu().numpy())
         print(f"Successfully saved {len(flattened_features)} layer file(s) for {class_name}.")
-        
+
 
 def main2(args):
     image_size = 224
@@ -321,12 +340,12 @@ def main2(args):
                 ),
             ]
         )
-    
+
     if args.dataset in SETTINGS.keys():
         CLASS_NAMES = SETTINGS[args.dataset]
     else:
         raise ValueError(f"Dataset setting must be in {SETTINGS.keys()}, but got {args.dataset}.")
-    
+
     for class_name in CLASS_NAMES:
         train_dataset = FEWSHOTDATA(root_dir, class_name=class_name, train=True, img_size=image_size, crp_size=image_size,
                             msk_size=image_size, msk_crp_size=image_size)
@@ -335,14 +354,14 @@ def main2(args):
             train_dataset, batch_size=4, shuffle=False, num_workers=8, drop_last=False
         )
         layer1_features, layer2_features, layer3_features, layer4_features = [], [], [], []
-        
+
         for batch in tqdm.tqdm(train_loader):
             images, _, _, _ = batch
             with torch.no_grad():
                 patch_features = encoder.encode_image_from_tensors(images.to(device))
             layer1_features.append(patch_features[0])
             layer2_features.append(patch_features[1])
-            layer3_features.append(patch_features[2]) 
+            layer3_features.append(patch_features[2])
             layer4_features.append(patch_features[3])
         layer1_features = torch.cat(layer1_features, dim=0)
         layer2_features = torch.cat(layer2_features, dim=0)
@@ -352,20 +371,31 @@ def main2(args):
         print(layer2_features.shape)
         print(layer3_features.shape)
         print(layer4_features.shape)
-        
+
         layer1_features = layer1_features.reshape(-1, 1280)
         layer2_features = layer2_features.reshape(-1, 1280)
         layer3_features = layer3_features.reshape(-1, 1280)
         layer4_features = layer4_features.reshape(-1, 1280)
-        
+
         os.makedirs(os.path.join(args.save_dir, class_name), exist_ok=True)
-        
+
         np.save(os.path.join(args.save_dir, class_name, 'layer1.npy'), layer1_features.cpu().numpy())
         np.save(os.path.join(args.save_dir, class_name, 'layer2.npy'), layer2_features.cpu().numpy())
         np.save(os.path.join(args.save_dir, class_name, 'layer3.npy'), layer3_features.cpu().numpy())
         np.save(os.path.join(args.save_dir, class_name, 'layer4.npy'), layer4_features.cpu().numpy())
-        
-        
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    value = v.lower()
+    if value in ("yes", "true", "t", "1"):
+        return True
+    if value in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="mvtec")
@@ -377,13 +407,20 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, default="./ref_features/w50/mvtec_4shot")
     parser.add_argument('--output_dir', type=str, default="")
     parser.add_argument('--backbone', type=str, default="wide_resnet50_2")#10/26追加
-    parser.add_argument('--feature_backbone', type=str, default="original", choices=["original", "clip_raw"])
+    parser.add_argument('--feature_backbone', type=str, default="adaclip_prompted", choices=["adaclip_prompted"])
     parser.add_argument('--clip_model', type=str, default="ViT-L-14-336")
     parser.add_argument('--clip_pretrained', type=str, default="openai")
     parser.add_argument('--clip_weight_source', type=str, default="open_clip", choices=["open_clip", "openai_local"])
     parser.add_argument('--clip_checkpoint', type=str, default="")
     parser.add_argument('--clip_layers', type=int, nargs="+", default=[6, 12, 24])
-    parser.add_argument('--clip_image_size', type=int, default=518)
+    parser.add_argument('--clip_image_size', type=int, default=336)
+    parser.add_argument('--adaclip_repo_url', type=str, default="https://github.com/tomo082/AdaCLIP_res")
+    parser.add_argument('--adaclip_repo_path', type=str, default="")
+    parser.add_argument('--adaclip_checkpoint', type=str, default="")
+    parser.add_argument('--adaclip_checkpoint_url', type=str, default="")
+    parser.add_argument('--adaclip_cache_dir', type=str, default="~/.cache/adaclip_res")
+    parser.add_argument('--adaclip_model', type=str, default="ViT-L-14-336")
+    parser.add_argument('--adaclip_return_projected', type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--dinov2_feature_mode", type=str, default="final_projected", choices=DINOV2_FEATURE_MODES)
     parser.add_argument("--dinov2_layers", type=int, nargs="+", default=[4, 8, 12])
     parser.add_argument("--dinov2_proj_dim", type=int, default=256)

@@ -4,7 +4,7 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 import matplotlib
 import matplotlib.pyplot as plt
-
+from utils import get_image_scores
 
 def denormalization(x, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
     mean = np.array(mean)
@@ -33,6 +33,9 @@ class Visualizer(object):
         vmin = scores.min() * 255. + 80
         vmax = vmax - 20
         norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
+        img_scores = get_image_scores(scores, topk=10)#6.27
+        rank = np.argsort(img_scores)
+        rank = np.argsort(rank)
         for i in range(len(scores)):
             img = test_imgs[i]
             img = denormalization(img)
@@ -54,7 +57,7 @@ class Visualizer(object):
             ax_img[1].title.set_text('GroundTruth')
             ax_img[2].imshow(heat_map, cmap='jet', norm=norm, interpolation='none')
             ax_img[2].imshow(img, cmap='gray', alpha=0.7, interpolation='none')
-            ax_img[2].title.set_text('Segmentation')
+            ax_img[2].title.set_text('Segmentation' + str(rank[i]) + '/' + str(len(rank)) + '/' + str(img_scores[i]))
             
             fig_img.savefig(os.path.join(self.root, str(i) + '.png'), dpi=300)
             # if img_types[i] == 'good':

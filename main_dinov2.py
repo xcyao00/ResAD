@@ -21,8 +21,9 @@ from datasets.capsules import CAPSULES, CAPSULESANO
 
 from models.fc_flow import load_flow_model
 from models.modules import MultiScaleConv
+from models.dinov2_backbone import DINOv2BackboneWrapper, DINOV2_BACKBONES, DINOV2_FEATURE_MODES
+from models.dinov2_backbone import dinov2_shape_test, print_dinov2_config
 from models.vq import MultiScaleVQ
-from models.clip_feature_extractor import CLIPRawFeatureExtractor
 from utils import init_seeds, get_residual_features, get_mc_matched_ref_features, get_mc_reference_features
 from utils import BoundaryAverager
 from losses.loss import calculate_log_barrier_bi_occ_loss
@@ -41,60 +42,22 @@ SETTINGS = {'visa_to_mvtec': VISA_TO_MVTEC, 'mvtec_to_visa': MVTEC_TO_VISA,
             'mvtec_to_brats': MVTEC_TO_BRATS,'mvtec_to_mvtec':MVTEC_TO_MVTEC, 'visa_to_visa':VISA_TO_VISA, 'capsules_to_capsules': CAPSULES_TO_CAPSULES}
 
 
-def get_feature_image_size(args):
-    if args.feature_backbone == "clip_raw":
-        return args.clip_image_size
-    return 224
-
-
-def build_feature_encoder(args):
-    if args.feature_backbone == "clip_raw":
-        if len(args.clip_layers) != 3:
-            raise ValueError("clip_raw currently expects exactly 3 clip_layers for ResAD multi-level features.")
-        encoder = CLIPRawFeatureExtractor(
-            model_name=args.clip_model,
-            pretrained=args.clip_pretrained,
-            layers=args.clip_layers,
-            image_size=args.clip_image_size,
-            freeze=True,
-            weight_source=args.clip_weight_source,
-            checkpoint=args.clip_checkpoint,
-        ).to(args.device)
-        encoder.eval()
-        return encoder, encoder.feature_info.channels()
-
-    if args.feature_backbone != "original":
-        raise ValueError(f"Unsupported feature_backbone: {args.feature_backbone}")
-    if args.backbone == 'wide_resnet50_2':
-        encoder = timm.create_model('wide_resnet50_2', features_only=True,
-                out_indices=(1, 2, 3), pretrained=True).eval()
-        encoder = encoder.to(args.device)
-        return encoder, encoder.feature_info.channels()
-    if args.backbone == 'tf_efficientnet_b6':
-        encoder = timm.create_model('tf_efficientnet_b6', features_only=True,
-                out_indices=(1, 2, 3), pretrained=True).eval()
-        encoder = encoder.to(args.device)
-        return encoder, encoder.feature_info.channels()
-    raise ValueError(f"Unsupported backbone: {args.backbone}")
-
-
 def main(args):
     if args.setting in SETTINGS.keys():
         CLASSES = SETTINGS[args.setting]
     else:
         raise ValueError(f"Dataset setting must be in {SETTINGS.keys()}, but got {args.setting}.")
-    image_size = get_feature_image_size(args)
-
+                
     if args.classes == 'capsules':  # from mvtec to other datasets  # from mvtec to other datasets
         train_dataset1 = CAPSULES(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
                                normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                               img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
         train_dataset2 = CAPSULESANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
                                   normalize='w50',
-                                  img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                  img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader2 = DataLoader(
             train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )    
@@ -102,45 +65,56 @@ def main(args):
     elif CLASSES['seen'][0] in MVTEC.CLASS_NAMES:  # from mvtec to other datasets
         train_dataset1 = MVTEC(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
                                normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                               img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
         train_dataset2 = MVTECANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
                                   normalize='w50',
-                                  img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                  img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader2 = DataLoader(
             train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
     else:  # from visa to mvtec
         train_dataset1 = VISA(args.train_dataset_dir, class_name=CLASSES['seen'], train=True,
                                normalize="w50",
-                               img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                               img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader1 = DataLoader(
             train_dataset1, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
         train_dataset2 = VISAANO(args.train_dataset_dir, class_name=CLASSES['seen'], train=True, 
                                  normalize="w50",
-                                 img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                 img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
         train_loader2 = DataLoader(
             train_dataset2, batch_size=args.batch_size, shuffle=True, num_workers=8, drop_last=True
         )
-    encoder, feat_dims = build_feature_encoder(args)
-    if len(feat_dims) != args.feature_levels:
-        raise ValueError(
-            f"feature_levels={args.feature_levels} does not match encoder outputs {len(feat_dims)}. "
-            "For clip_raw, keep --feature_levels 3 with the default three --clip_layers."
-        )
+    if args.backbone == 'wide_resnet50_2':
+        encoder = timm.create_model('wide_resnet50_2', features_only=True,
+                out_indices=(1, 2, 3), pretrained=True).eval()  # the pretrained checkpoint will be in /home/.cache/torch/hub/checkpoints/
+        encoder = encoder.to(args.device)
+        feat_dims = encoder.feature_info.channels()
+    elif args.backbone == 'tf_efficientnet_b6':#10/26追加
+        encoder = timm.create_model('tf_efficientnet_b6', features_only=True,
+                out_indices=(1, 2, 3), pretrained=True).eval()  # the pretrained checkpoint will be in /home/.cache/torch/hub/checkpoints/
+        encoder = encoder.to(args.device)
+        feat_dims = encoder.feature_info.channels()
+    elif args.backbone in DINOV2_BACKBONES:
+        encoder = DINOv2BackboneWrapper(
+            model_name=args.backbone,
+            freeze=True,
+            feature_mode=args.dinov2_feature_mode,
+            layers=args.dinov2_layers,
+            proj_dim=args.dinov2_proj_dim,
+        ).to(args.device)
+        encoder.eval()
+        feat_dims = encoder.feature_info.channels()
+        print_dinov2_config(encoder, image_size=224)
+    else:
+        raise ValueError(f"Unsupported backbone: {args.backbone}")
     boundary_ops = BoundaryAverager(num_levels=args.feature_levels)
-    use_vqops = not args.disable_vqops
-    print("[VQOps] use_vqops:", use_vqops)
-    vq_ops = None
-    optimizer_vq = None
-    scheduler_vq = None
-    if use_vqops:
-        vq_ops = MultiScaleVQ(num_embeddings=args.num_embeddings, channels=feat_dims).to(args.device)
-        optimizer_vq = torch.optim.Adam(vq_ops.parameters(), lr=args.lr, weight_decay=0.0005)
-        scheduler_vq = torch.optim.lr_scheduler.MultiStepLR(optimizer_vq, milestones=[70, 90], gamma=0.1)
+    vq_ops = MultiScaleVQ(num_embeddings=args.num_embeddings, channels=feat_dims).to(args.device)
+    optimizer_vq = torch.optim.Adam(vq_ops.parameters(), lr=args.lr, weight_decay=0.0005)
+    scheduler_vq = torch.optim.lr_scheduler.MultiStepLR(optimizer_vq, milestones=[70, 90], gamma=0.1)
     
     constraintor = MultiScaleConv(feat_dims).to(args.device)
     # weight_decay is the l2 weight penalty lambda, weight_decay = lambda / 2
@@ -159,8 +133,7 @@ def main(args):
     best_img_auc = 0
     N_batch = 8192
     for epoch in range(args.epochs):
-        if vq_ops is not None:
-            vq_ops.train()
+        vq_ops.train()
         constraintor.train()
         for estimator in estimators:
             estimator.train()
@@ -181,14 +154,7 @@ def main(args):
             with torch.no_grad():
                 features = encoder(images)
             
-            ref_features = get_mc_reference_features(
-                encoder,
-                args.train_dataset_dir,
-                class_names,
-                images.device,
-                args.train_ref_shot,
-                img_size=image_size,
-            )
+            ref_features = get_mc_reference_features(encoder, args.train_dataset_dir, class_names, images.device, args.train_ref_shot)
             mfeatures = get_mc_matched_ref_features(features, class_names, ref_features)
             rfeatures = get_residual_features(features, mfeatures, pos_flag=True)
             
@@ -199,13 +165,12 @@ def main(args):
                 lvl_masks.append(m)
             rfeatures_t = [rfeature.detach().clone() for rfeature in rfeatures]
             
-            if vq_ops is not None:
-                loss_vq = vq_ops(rfeatures, lvl_masks, train=True)
-                train_loss_total += loss_vq.item()
-                total_num += 1
-                optimizer_vq.zero_grad()
-                loss_vq.backward()
-                optimizer_vq.step()
+            loss_vq = vq_ops(rfeatures, lvl_masks, train=True)
+            train_loss_total += loss_vq.item()
+            total_num += 1
+            optimizer_vq.zero_grad()
+            loss_vq.backward()
+            optimizer_vq.step()
             
             rfeatures = constraintor(*rfeatures)
             loss = 0
@@ -234,8 +199,7 @@ def main(args):
             train_loss_total += loss
             total_num += num
         
-        if scheduler_vq is not None:
-            scheduler_vq.step()
+        scheduler_vq.step()
         scheduler0.step()
         scheduler1.step()
                
@@ -249,35 +213,35 @@ def main(args):
                 if args.classes == 'capsules':
                     test_dataset = CAPSULES(args.test_dataset_dir, class_name=class_name, train=False,
                                          normalize='w50',
-                                         img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                         img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)                            
                 elif class_name in MVTEC.CLASS_NAMES:
                     test_dataset = MVTEC(args.test_dataset_dir, class_name=class_name, train=False,
                                          normalize='w50',
-                                         img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                         img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in VISA.CLASS_NAMES:
                     test_dataset = VISA(args.test_dataset_dir, class_name=class_name, train=False,
                                         normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                        img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in BTAD.CLASS_NAMES:
                     test_dataset = BTAD(args.test_dataset_dir, class_name=class_name, train=False,
                                         normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                        img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MVTEC3D.CLASS_NAMES:
                     test_dataset = MVTEC3D(args.test_dataset_dir, class_name=class_name, train=False,
                                            normalize='w50',
-                                           img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                           img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MPDD.CLASS_NAMES:
                     test_dataset = MPDD(args.test_dataset_dir, class_name=class_name, train=False,
                                         normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                        img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in MVTECLOCO.CLASS_NAMES:
                     test_dataset = MVTECLOCO(args.test_dataset_dir, class_name=class_name, train=False,
                                         normalize='w50',
-                                        img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                        img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 elif class_name in BRATS.CLASS_NAMES:
                     test_dataset = BRATS(args.test_dataset_dir, class_name=class_name, train=False,
                                            normalize='w50',
-                                           img_size=image_size, crp_size=image_size, msk_size=image_size, msk_crp_size=image_size)
+                                           img_size=224, crp_size=224, msk_size=224, msk_crp_size=224)
                 else:
                     raise ValueError('Unrecognized class name: {}'.format(class_name))
                 test_loader = DataLoader(
@@ -308,10 +272,9 @@ def main(args):
             if img_auc > best_img_auc:
                 os.makedirs(args.checkpoint_path, exist_ok=True)
                 best_img_auc = img_auc
-                state_dict = {'constraintor': constraintor.state_dict(),
+                state_dict = {'vq_ops': vq_ops.state_dict(),
+                              'constraintor': constraintor.state_dict(),
                               'estimators': [estimator.state_dict() for estimator in estimators]}
-                if vq_ops is not None:
-                    state_dict['vq_ops'] = vq_ops.state_dict()
                 torch.save(state_dict, os.path.join(args.checkpoint_path, f'{args.setting}_epoch_{epoch}_checkpoints.pth'))
                 #torch.save(state_dict, os.path.join(args.checkpoint_path, f'{args.setting}_checkpoints.pth'))
 
@@ -354,13 +317,10 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_path', type=str, default="./checkpoints/")
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--backbone', type=str, default="wide_resnet50_2")
-    parser.add_argument('--feature_backbone', type=str, default="original", choices=["original", "clip_raw"])
-    parser.add_argument('--clip_model', type=str, default="ViT-L-14-336")
-    parser.add_argument('--clip_pretrained', type=str, default="openai")
-    parser.add_argument('--clip_weight_source', type=str, default="open_clip", choices=["open_clip", "openai_local"])
-    parser.add_argument('--clip_checkpoint', type=str, default="")
-    parser.add_argument('--clip_layers', type=int, nargs="+", default=[6, 12, 24])
-    parser.add_argument('--clip_image_size', type=int, default=518)
+    parser.add_argument("--dinov2_feature_mode", type=str, default="intermediate_fixed_projected", choices=DINOV2_FEATURE_MODES)
+    parser.add_argument("--dinov2_layers", type=int, nargs="+", default=[4, 8, 12])
+    parser.add_argument("--dinov2_proj_dim", type=int, default=0)
+    parser.add_argument("--dino_shape_test", action="store_true")
     parser.add_argument('--rank', type=int, default="0")    
     
     # flow parameters
@@ -375,12 +335,23 @@ if __name__ == "__main__":
     
     parser.add_argument('--fdm_alpha', type=float, default=0.4)  # low value, more training distribution
     parser.add_argument('--num_embeddings', type=int, default=1536)  # VQ embeddings
-    parser.add_argument('--disable_vqops', action='store_true')
     parser.add_argument("--train_ref_shot", type=int, default=4)
     parser.add_argument("--num_ref_shot", type=int, default=4)
     
     args = parser.parse_args()
     init_seeds(42)
+    if args.dino_shape_test:
+        test_device = args.device if torch.cuda.is_available() and str(args.device).startswith("cuda") else "cpu"
+        model_name = args.backbone if args.backbone in DINOV2_BACKBONES else "dinov2_vits14"
+        dinov2_shape_test(
+            model_name=model_name,
+            device=test_device,
+            feature_mode=args.dinov2_feature_mode,
+            layers=args.dinov2_layers,
+            proj_dim=args.dinov2_proj_dim,
+        )
+        print("DINOv2 shape test passed.")
+        raise SystemExit(0)
     
     main(args)
             
